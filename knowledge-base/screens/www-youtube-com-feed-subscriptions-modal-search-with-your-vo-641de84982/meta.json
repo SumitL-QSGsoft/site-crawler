@@ -1,0 +1,10 @@
+{
+  "screenId": "www-youtube-com-feed-subscriptions-modal-search-with-your-vo-641de84982",
+  "url": "https://www.youtube.com/feed/subscriptions",
+  "normalizedUrl": "https://www.youtube.com/feed/subscriptions#modal:search-with-your-voice",
+  "depth": 2,
+  "discoveredVia": "modal: \"Search with your voice\"",
+  "title": "Subscriptions - YouTube",
+  "httpStatus": null,
+  "crawledAt": "2026-09-15T04:50:28.271Z"
+}

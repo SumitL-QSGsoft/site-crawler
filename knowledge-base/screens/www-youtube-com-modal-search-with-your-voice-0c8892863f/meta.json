@@ -1,0 +1,10 @@
+{
+  "screenId": "www-youtube-com-modal-search-with-your-voice-0c8892863f",
+  "url": "https://www.youtube.com/",
+  "normalizedUrl": "https://www.youtube.com/#modal:search-with-your-voice",
+  "depth": 1,
+  "discoveredVia": "modal: \"Search with your voice\"",
+  "title": "YouTube",
+  "httpStatus": null,
+  "crawledAt": "2026-09-15T04:49:17.073Z"
+}

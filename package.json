@@ -1,0 +1,17 @@
+{
+  "name": "site-knowledge-crawler",
+  "version": "1.0.0",
+  "description": "Crawl a live web app into an LLM-ready knowledge base",
+  "type": "module",
+  "main": "index.js",
+  "bin": {
+    "site-knowledge-crawler": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "postinstall": "playwright install chromium"
+  },
+  "dependencies": {
+    "playwright": "^1.47.0"
+  }
+}
