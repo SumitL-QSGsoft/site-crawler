@@ -16,7 +16,7 @@ const MAX_NESTED_CLICKS = 2;
 // chance to settle before we read the page. Avoids the whole page being skipped on a 30s timeout.
 async function gotoAndSettle(target, url, { timeout = 30000 } = {}) {
   const response = await target.goto(url, { waitUntil: "domcontentloaded", timeout });
-  await target.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
+  await target.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => { });
   return response;
 }
 
@@ -200,7 +200,7 @@ async function verifyLoginSucceeded(browser, storageState, url) {
   } catch {
     return true; // don't block the crawl over a verification hiccup
   } finally {
-    await checkContext.close().catch(() => {});
+    await checkContext.close().catch(() => { });
   }
 }
 

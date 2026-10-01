@@ -9,9 +9,12 @@
   },
   "scripts": {
     "start": "node index.js",
+    "web": "node webapp/server.js",
+    "test": "node --test",
     "postinstall": "playwright install chromium"
   },
   "dependencies": {
+    "express": "^4.19.2",
     "playwright": "^1.47.0"
   }
 }

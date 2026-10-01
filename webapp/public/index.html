@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Site Knowledge Crawler — Demo</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <h1>Site Knowledge Crawler</h1>
+      <p class="subtitle">Crawl any website into a browsable knowledge base of screens, modals, actions &amp; forms.</p>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="panel form-panel">
+      <form id="crawl-form">
+        <div class="field field-url">
+          <label for="url">Website URL</label>
+          <input id="url" name="url" type="url" placeholder="https://example.com" required />
+        </div>
+
+        <details class="advanced">
+          <summary>Advanced options</summary>
+          <div class="advanced-grid">
+            <div class="field">
+              <label for="maxPages">Max screens</label>
+              <input id="maxPages" name="maxPages" type="number" min="1" max="300" value="200" />
+            </div>
+            <div class="field">
+              <label for="maxDepth">Max link depth</label>
+              <input id="maxDepth" name="maxDepth" type="number" min="0" max="20" value="10" />
+            </div>
+            <div class="field">
+              <label for="delayMs">Delay between pages (ms)</label>
+              <input id="delayMs" name="delayMs" type="number" min="100" max="5000" step="100" value="400" />
+            </div>
+            <div class="field">
+              <label for="workers">Parallel workers</label>
+              <input id="workers" name="workers" type="number" min="1" max="10" value="8" />
+            </div>
+            <div class="field field-checkbox">
+              <label><input id="sameOriginOnly" name="sameOriginOnly" type="checkbox" checked /> Stay on same
+                domain</label>
+            </div>
+          </div>
+        </details>
+
+        <button id="start-btn" type="submit">Start Crawl</button>
+      </form>
+    </section>
+
+    <section id="status-panel" class="panel status-panel hidden">
+      <div class="status-header">
+        <span id="status-badge" class="badge">running</span>
+        <span id="status-url"></span>
+        <span id="status-elapsed" class="elapsed"></span>
+      </div>
+      <p id="status-hint" class="muted-hint hidden">
+        Still crawling — larger sites with lots of buttons/menus can take a few minutes since each
+        one is probed for hidden navigation/modals. Raising "Max screens"/"Max link depth" directly
+        increases total crawl time; past ~6-8 parallel workers, more usually stops helping.
+      </p>
+      <pre id="log-output" class="log-output"></pre>
+      <p id="error-message" class="error-message hidden"></p>
+    </section>
+
+    <section id="auth-panel" class="panel auth-panel hidden">
+      <h3>Login required</h3>
+      <p class="muted-hint">
+        The crawler hit what looks like a login page at <code id="auth-url"></code>. Enter
+        credentials to let it log in and keep crawling past it, or skip to continue without
+        authenticating.
+      </p>
+      <form id="auth-form">
+        <div class="field">
+          <label for="auth-username">Username / email</label>
+          <input id="auth-username" name="username" type="text" autocomplete="username" required />
+        </div>
+        <div class="field">
+          <label for="auth-password">Password</label>
+          <input id="auth-password" name="password" type="password" autocomplete="current-password" required />
+        </div>
+        <div class="auth-actions">
+          <button id="auth-submit-btn" type="submit">Log in &amp; continue</button>
+          <button id="auth-skip-btn" type="button" class="secondary">Skip login</button>
+        </div>
+      </form>
+    </section>
+
+    <section id="results" class="results hidden">
+      <div class="stats-grid" id="stats-grid"></div>
+
+      <div class="tabs">
+        <button class="tab-btn active" data-tab="screens">Screens &amp; Modals</button>
+        <button class="tab-btn" data-tab="graph">Navigation Graph</button>
+      </div>
+
+      <div id="tab-screens" class="tab-content">
+        <div id="screens-list" class="screens-list"></div>
+      </div>
+
+      <div id="tab-graph" class="tab-content hidden">
+        <pre class="mermaid" id="graph-mermaid"></pre>
+      </div>
+    </section>
+  </main>
+
+  <div id="lightbox" class="lightbox hidden">
+    <img id="lightbox-img" src="" alt="Screenshot" />
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script src="/app.js"></script>
+</body>
+
+</html>
