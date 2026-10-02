@@ -6,6 +6,13 @@ import fs from "node:fs/promises";
 import { BrowserManager } from "../src/browser/browser-manager.js";
 import { Crawler } from "../src/crawl/crawler.js";
 import { createLogger } from "../src/core/logger.js";
+import { computeStateFingerprint } from "../src/crawl/state-fingerprint.js";
+
+test("fingerprint detects a new customer even when structure stays the same", () => {
+  const empty = { title: "Customers", headings: [{ text: "Customers" }], bodyText: "No customers", links: [] };
+  const populated = { ...empty, bodyText: "Customer 123", links: [{ href: "http://crawler.test/customers/123", text: "Customer 123" }] };
+  assert.notEqual(computeStateFingerprint(empty), computeStateFingerprint(populated));
+});
 
 // Two different routes rendering byte-for-byte the same screen (title, heading, and button/link
 // counts all match) - the click/form discovery pass should only ever run once across them.

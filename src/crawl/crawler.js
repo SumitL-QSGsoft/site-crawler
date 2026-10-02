@@ -1,7 +1,9 @@
 import path from "node:path";
-import { gotoAndSettle, settleAfterAction } from "../browser/navigation.js";
+import fs from "node:fs/promises";
+import { gotoAndSettle, settleAfterAction, waitForContentReady } from "../browser/navigation.js";
 import { extractScreen } from "../extraction/screen-extractor.js";
 import { probeClickNavigation } from "../discovery/click-probe.js";
+import { getCandidateSnapshot } from "../discovery/dom-snapshot.js";
 import { probeFormSubmission } from "../discovery/form-probe.js";
 import { looksLikeLoginPage, verifyLoginSucceeded } from "../auth/login-wall.js";
 import { promptAndAuthenticate } from "../auth/interactive-prompter.js";
@@ -16,7 +18,7 @@ import { ScreenWriter } from "./screen-writer.js";
 import { CrawlQueue } from "./crawl-queue.js";
 import { buildIndex } from "./index-builder.js";
 import { buildAppMapEntry, buildKnowledgeBaseMarkdown, buildManifest } from "./app-map-builder.js";
-import { computeStateFingerprint } from "./state-fingerprint.js";
+import { computeStateFingerprint, computeProbeFingerprint, pageSignature } from "./state-fingerprint.js";
 
 const DEFAULT_MAX_CLICK_CANDIDATES = Infinity;
 const DEFAULT_MAX_FORMS_PER_PAGE = 10;
@@ -63,16 +65,43 @@ export class Crawler {
     const contextRef = { current: initialContext };
     const allContexts = [initialContext];
 
+    const baselineDir = config.baselineDir || outDir;
+    const checkpointPath = path.join(baselineDir, "crawl-state.json");
+    const checkpoint = await fs.readFile(checkpointPath, "utf8").then(JSON.parse).catch((error) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    if (checkpoint && (checkpoint.version !== 1 || normalizeUrl(checkpoint.startUrl) !== normalizeUrl(startUrl))) {
+      throw new Error("Saved crawl does not match this starting URL or checkpoint version.");
+    }
+    const incremental = checkpoint && checkpoint.maxDepth === maxDepth && checkpoint.sameOriginOnly === sameOriginOnly;
+    if (checkpoint && !incremental) this.#logger.warn("Crawl settings changed; running a fresh crawl.");
+    const previousPages = new Map(incremental ? checkpoint.pages.map((entry) => [normalizeUrl(entry.url), entry]) : []);
+    const priorGraph = incremental ? JSON.parse(await fs.readFile(path.join(baselineDir, "graph.json"), "utf8")) : {};
     const queue = new CrawlQueue();
-    const graph = new GraphStore();
+    const graph = new GraphStore(priorGraph);
     const screenWriter = new ScreenWriter(outDir, this.#logger);
-    const appMap = []; // AutoQA-style app-map.json entries, one per screen/modal written
-    const modules = []; // { title, markdown } per screen/modal, for the consolidated knowledge base
+    const appMap = incremental ? JSON.parse(await fs.readFile(path.join(baselineDir, "app-map.json"), "utf8")) : [];
+    const modules = incremental ? await Promise.all(graph.nodes.map(async (node) => ({
+      title: node.title || node.id,
+      markdown: await fs.readFile(path.join(baselineDir, "modules", `${node.id}.md`), "utf8"),
+      id: node.id,
+    }))) : [];
     const authState = { probeDone: false }; // only ask to authenticate once per crawl run, across all workers
     const counters = { pagesDone: 0 }; // shared mutable count, since plain numbers can't be passed by reference across workers
 
-    queue.seed({ url: startUrl, depth: 0, discoveredVia: "seed" }, normalizeUrl(startUrl));
     await screenWriter.init();
+    if (incremental && baselineDir !== outDir) {
+      await fs.cp(path.join(baselineDir, "screens"), path.join(outDir, "screens"), { recursive: true });
+      await fs.cp(path.join(baselineDir, "modules"), path.join(outDir, "modules"), { recursive: true });
+    }
+    for (const entry of previousPages.values()) {
+      if (normalizeUrl(entry.url) === normalizeUrl(startUrl)) continue;
+      queue.markVisited(normalizeUrl(entry.url));
+      queue.push({ url: entry.url, depth: entry.depth, discoveredVia: entry.discoveredVia,
+        parentScreenId: entry.parentScreenId, fromUrl: entry.fromUrl });
+    }
+    queue.seed({ url: startUrl, depth: 0, discoveredVia: "seed" }, normalizeUrl(startUrl));
 
     const shared = {
       startUrl,
@@ -95,14 +124,43 @@ export class Crawler {
       modules,
       authState,
       counters,
+      previousPages,
     };
 
     const workerCount = Math.max(1, concurrency);
     if (workerCount > 1) this.#logger.info(`crawling with ${workerCount} parallel workers`);
     shared.concurrency = workerCount; // also used to bound concurrent click/form probing within one screen
-    await Promise.all(Array.from({ length: workerCount }, () => this.#runWorker(shared)));
+    try {
+      if (incremental) {
+        let retryAuth;
+        do {
+          const item = await queue.next();
+          const contextBefore = contextRef.current;
+          try {
+            await this.#processItem(item, shared);
+          } finally {
+            queue.finish();
+          }
+          retryAuth = contextBefore !== contextRef.current;
+        } while (retryAuth);
+      }
+      await Promise.all(Array.from({ length: workerCount }, () => this.#runWorker(shared)));
+    } finally {
+      queue.stop();
+      await Promise.all(allContexts.map((ctx) => ctx.close().catch(() => { })));
+    }
 
-    await Promise.all(allContexts.map((ctx) => ctx.close().catch(() => { })));
+    graph.retainReachable(`${slugify(startUrl)}-${shortId(normalizeUrl(startUrl))}`);
+    const retained = new Set(graph.nodes.map((node) => node.id));
+    for (const [url] of previousPages) {
+      if (!graph.nodes.some((node) => normalizeUrl(node.url) === url)) previousPages.delete(url);
+    }
+    for (let index = appMap.length - 1; index >= 0; index--) {
+      if (!retained.has(appMap[index].slug)) appMap.splice(index, 1);
+    }
+    for (let index = modules.length - 1; index >= 0; index--) {
+      if (!retained.has(modules[index].id)) modules.splice(index, 1);
+    }
 
     await writeJson(path.join(outDir, "graph.json"), graph.toJSON());
     await writeText(path.join(outDir, "index.md"), buildIndex(graph.nodes, graph.edges, config));
@@ -114,19 +172,29 @@ export class Crawler {
       path.join(outDir, "index.json"),
       buildManifest(appMap, { startUrl, generatedAt, pagesDone: counters.pagesDone, maxPages, maxDepth })
     );
+    await writeJson(path.join(outDir, "crawl-state.json"), {
+      version: 1, startUrl, maxDepth, sameOriginOnly, pages: [...previousPages.values()],
+    });
 
     return { nodes: graph.nodes, edges: graph.edges, pagesDone: counters.pagesDone };
   }
 
-  // Keeps pulling the next item off the shared DFS stack until it's drained or the page budget
-  // runs out. Safe to run several of these concurrently: the check-then-pop in CrawlQueue#shift
-  // is synchronous (no `await` in between), so two workers can never race for the same item.
+  // Idle workers wait for pages discovered by other workers instead of exiting when the stack
+  // is briefly empty. The queue hands each item to exactly one worker.
   async #runWorker(shared) {
     const { queue, counters, maxPages } = shared;
-    while (queue.length && counters.pagesDone < maxPages) {
-      const item = queue.shift();
+    while (counters.pagesDone < maxPages) {
+      const item = await queue.next();
       if (!item) break;
-      await this.#processItem(item, shared);
+      try {
+        await this.#processItem(item, shared);
+      } catch (error) {
+        queue.stop();
+        throw error;
+      } finally {
+        if (counters.pagesDone >= maxPages) queue.stop();
+        queue.finish();
+      }
     }
   }
 
@@ -141,6 +209,7 @@ export class Crawler {
       screenWriter,
       appMap,
       modules,
+      previousPages,
       authState,
       counters,
       startUrl,
@@ -179,8 +248,29 @@ export class Crawler {
         this.#logger.warn(`skipping ${item.url} (HTTP ${status})`);
         return;
       }
+      if (item.fromUrl && normalizeUrl(page.url()) !== normUrl) {
+        if (!(await this.#retryViaClientNav(page, item)) || normalizeUrl(page.url()) !== normUrl) {
+          this.#logger.warn(`skipping ${item.url} (redirected to ${page.url()})`);
+          return;
+        }
+        response = null;
+      }
 
-      await sleep(delayMs);
+      if (!(await waitForContentReady(page)) && !(await waitForContentReady(page))) {
+        this.#logger.warn(`content still unavailable for ${item.url}; leaving it uncaptured for a later crawl`);
+        return;
+      }
+
+      const previous = previousPages.get(normUrl);
+      if (previous && normalizeUrl(page.url()) === normUrl && !(await page.locator('input[type="password"]').count())) {
+        const signature = await pageSignature(page);
+        if (signature === previous.signature) {
+          this.#logger.info(`unchanged: ${item.url}`);
+          return;
+        }
+      }
+
+      if (!previous) await sleep(delayMs);
 
       const screenId = `${slugify(item.url)}-${shortId(normUrl)}`;
       const extracted = await extractScreen(page);
@@ -197,6 +287,8 @@ export class Crawler {
         return;
       }
       queue.markVisitedState(stateFingerprint);
+
+      const signature = await pageSignature(page);
 
       if (!authState.probeDone && looksLikeLoginPage(extracted, item.url)) {
         // Setting this synchronously (before any `await` below) means only the first worker to
@@ -277,6 +369,10 @@ export class Crawler {
         }
       }
 
+      if (previous && looksLikeLoginPage(extracted, item.url)) {
+        throw new Error(`Login is required to refresh ${item.url}; previous crawl was left unchanged.`);
+      }
+
       const { markdown } = await screenWriter.writeScreen({
         page,
         extracted,
@@ -287,24 +383,34 @@ export class Crawler {
         discoveredVia: item.discoveredVia,
         status,
       });
-      appMap.push(buildAppMapEntry(extracted, { url: item.url, screenId }));
-      modules.push({ title: extracted.title || screenId, markdown });
+      const mapEntry = buildAppMapEntry(extracted, { url: item.url, screenId });
+      const mapIndex = appMap.findIndex((entry) => entry.slug === screenId);
+      if (mapIndex === -1) appMap.push(mapEntry);
+      else appMap[mapIndex] = mapEntry;
+      const moduleEntry = { id: screenId, title: extracted.title || screenId, markdown };
+      const moduleIndex = modules.findIndex((entry) => entry.id === screenId);
+      if (moduleIndex === -1) modules.push(moduleEntry);
+      else modules[moduleIndex] = moduleEntry;
 
       graph.addNode({ id: screenId, url: item.url, title: extracted.title, depth: item.depth });
       graph.addEdge({ from: item.parentScreenId, to: screenId, label: item.discoveredVia });
+      if (previous) graph.clearOutgoing(screenId);
+      previousPages.set(normUrl, { url: item.url, depth: item.depth, discoveredVia: item.discoveredVia,
+        parentScreenId: item.parentScreenId, fromUrl: item.fromUrl, signature });
       counters.pagesDone += 1;
 
       if (item.depth < maxDepth) {
-        this.#enqueueLinks({ queue, extracted, item, screenId, startUrl, sameOriginOnly });
+        this.#enqueueLinks({ queue, graph, extracted, item, screenId, startUrl, sameOriginOnly });
 
         // A different route rendering byte-for-byte the same screen (templated placeholder
         // pages, a nav link whose route never actually swapped content, ...) would otherwise
         // get every one of its buttons/menus/forms probed all over again for no new discovery -
         // only the first route to show this exact content gets the expensive probing pass.
-        if (queue.hasProbedContent(contentFingerprint)) {
+        const probeFingerprint = computeProbeFingerprint(extracted);
+        if (!previous && queue.hasProbedContent(probeFingerprint)) {
           this.#logger.debug(`skipping click/form discovery on ${item.url} - identical content already probed elsewhere`);
         } else {
-          queue.markProbedContent(contentFingerprint);
+          queue.markProbedContent(probeFingerprint);
 
           await this.#discoverClicks({
             context,
@@ -334,6 +440,7 @@ export class Crawler {
             sameOriginOnly,
             maxFormsPerPage,
             queue,
+            graph,
             probeConcurrency: shared.concurrency,
           });
         }
@@ -344,11 +451,14 @@ export class Crawler {
   }
 
   // Queues up same-page <a href> links found on this screen.
-  #enqueueLinks({ queue, extracted, item, screenId, startUrl, sameOriginOnly }) {
+  #enqueueLinks({ queue, graph, extracted, item, screenId, startUrl, sameOriginOnly }) {
     for (const link of extracted.links) {
       if (sameOriginOnly && !sameSite(link.href, startUrl)) continue;
       const normLink = normalizeUrl(link.href);
-      if (queue.hasVisited(normLink) || !isNavigable(normLink)) continue;
+      if (!isNavigable(normLink)) continue;
+      const known = graph.nodes.find((node) => normalizeUrl(node.url) === normLink);
+      if (known) graph.addEdge({ from: screenId, to: known.id, label: `link: "${link.text}"` });
+      if (queue.hasVisited(normLink)) continue;
 
       queue.markVisited(normLink);
       queue.push({
@@ -357,6 +467,7 @@ export class Crawler {
         discoveredVia: `link: "${link.text}"`,
         parentScreenId: screenId,
         fromUrl: item.url,
+        actionPath: item.actionPath,
       });
     }
   }
@@ -370,11 +481,20 @@ export class Crawler {
     if (!item.fromUrl) return false;
     try {
       await gotoAndSettle(page, item.fromUrl);
-      const escapedHref = item.url.replace(/"/g, '\\"');
-      const link = page.locator(`a[href="${escapedHref}"]`).first();
-      if (!(await link.count())) return false;
+      for (const action of item.actionPath || []) {
+        const current = (await getCandidateSnapshot(page)).find((entry) => entry.key === action.key && entry.label === action.label);
+        if (!current) return false;
+        const before = page.url();
+        await page.locator(`[data-cw-id="${current.id}"]`).click({ timeout: 3000 });
+        await settleAfterAction(page, before);
+      }
+      const linkId = await page.evaluate((target) => {
+        const link = window.__crawlerHelpers.deepQueryAll("a[href]").find((anchor) => anchor.href === target);
+        return link ? window.__crawlerHelpers.ensureCwId(link) : null;
+      }, item.url);
+      if (!linkId) return false;
       const before = page.url();
-      await link.click({ timeout: 3000 });
+      await page.locator(`[data-cw-id="${linkId}"]`).click({ timeout: 3000 });
       await settleAfterAction(page, before);
       return normalizeUrl(page.url()) !== normalizeUrl(before);
     } catch {
@@ -404,6 +524,15 @@ export class Crawler {
   }) {
     const candidates = (extracted.navCandidates || []).slice(0, maxClickCandidates);
     const visitedActions = new Set();
+    const stateIds = new Map();
+
+    const parentFor = (path) => {
+      for (let length = path.length - 1; length > 0; length--) {
+        const id = stateIds.get(JSON.stringify(path.slice(0, length).map(({ key, label }) => [key, label])));
+        if (id) return id;
+      }
+      return screenId;
+    };
 
     if (candidates.length) {
       this.#logger.debug(`probing ${candidates.length} clickable candidate(s) on ${item.url}`);
@@ -411,6 +540,36 @@ export class Crawler {
 
     const captureResult = async (probeResult) => {
       const label = probeResult.label;
+      const parentScreenId = parentFor(probeResult.path || []);
+      if (probeResult.type === "state") {
+        const depth = item.depth + probeResult.depth;
+        if (depth > maxDepth || counters.pagesDone >= maxPages) return;
+        const syntheticUrl = `${item.url}#state:${shortId(probeResult.signature)}`;
+        const stateScreenId = `${slugify(syntheticUrl)}-${shortId(syntheticUrl)}`;
+        const pathKey = JSON.stringify(probeResult.path.map(({ key, label }) => [key, label]));
+        stateIds.set(pathKey, stateScreenId);
+        graph.addEdge({ from: parentScreenId, to: stateScreenId, label: `click: "${label}"` });
+        if (graph.nodes.some((node) => node.id === stateScreenId)) return;
+
+        const stateExtracted = await extractScreen(probeResult.page);
+        stateExtracted.screenId = stateScreenId;
+        stateExtracted.discoveredVia = `click: "${label}"`;
+        const { markdown } = await screenWriter.writeScreen({
+          page: probeResult.page, extracted: stateExtracted, screenId: stateScreenId,
+          url: syntheticUrl, normalizedUrl: syntheticUrl, depth,
+          discoveredVia: stateExtracted.discoveredVia, status: null,
+        });
+        appMap.push(buildAppMapEntry(stateExtracted, { url: syntheticUrl, screenId: stateScreenId }));
+        modules.push({ id: stateScreenId, title: stateExtracted.title || stateScreenId, markdown });
+        graph.addNode({ id: stateScreenId, url: syntheticUrl, title: stateExtracted.title, depth });
+        counters.pagesDone += 1;
+        if (depth < maxDepth) {
+          this.#enqueueLinks({ queue, graph, extracted: stateExtracted,
+            item: { ...item, depth, actionPath: probeResult.path.map(({ key, label }) => ({ key, label })) },
+            screenId: stateScreenId, startUrl, sameOriginOnly });
+        }
+        return;
+      }
       if (probeResult.type === "modal") {
         if (counters.pagesDone >= maxPages) return;
         const syntheticUrl = `${item.url}#modal:${slugify(label)}-${shortId(probeResult.key)}`;
@@ -428,11 +587,17 @@ export class Crawler {
           label,
           closePage: false,
         });
-        appMap.push(buildAppMapEntry(modalExtracted, { url: syntheticUrl, screenId: modalScreenId }));
-        modules.push({ title: modalExtracted.title || modalScreenId, markdown: modalMarkdown });
+        const modalEntry = buildAppMapEntry(modalExtracted, { url: syntheticUrl, screenId: modalScreenId });
+        const modalIndex = appMap.findIndex((entry) => entry.slug === modalScreenId);
+        if (modalIndex === -1) appMap.push(modalEntry);
+        else appMap[modalIndex] = modalEntry;
+        const modalModule = { id: modalScreenId, title: modalExtracted.title || modalScreenId, markdown: modalMarkdown };
+        const moduleIndex = modules.findIndex((entry) => entry.id === modalScreenId);
+        if (moduleIndex === -1) modules.push(modalModule);
+        else modules[moduleIndex] = modalModule;
 
         graph.addNode({ id: modalScreenId, url: syntheticUrl, title: modalExtracted.title, depth: item.depth + 1 });
-        graph.addEdge({ from: screenId, to: modalScreenId, label: discoveredVia });
+        graph.addEdge({ from: parentScreenId, to: modalScreenId, label: discoveredVia });
         counters.pagesDone += 1;
 
         // Real links inside the modal (e.g. a row in a "users" list dialog) so items like
@@ -458,17 +623,21 @@ export class Crawler {
 
       const resultUrl = probeResult.url;
       const normResult = normalizeUrl(resultUrl);
-      if (normResult === normalizeUrl(item.url) || queue.hasVisited(normResult)) return;
+      if (normResult === normalizeUrl(item.url)) return;
       if (sameOriginOnly && !sameSite(resultUrl, startUrl)) return;
       if (!isNavigable(normResult)) return;
+      const known = graph.nodes.find((node) => normalizeUrl(node.url) === normResult);
+      if (known) graph.addEdge({ from: parentScreenId, to: known.id, label: `click: "${label}"` });
+      if (queue.hasVisited(normResult)) return;
 
       queue.markVisited(normResult);
       queue.push({
         url: resultUrl,
-        depth: item.depth + 1,
+        depth: item.depth + (probeResult.path?.length || 1),
         discoveredVia: `click: "${label}"`,
-        parentScreenId: screenId,
+        parentScreenId,
         fromUrl: item.url,
+        actionPath: probeResult.path?.map(({ key, label }) => ({ key, label })),
       });
     };
 
@@ -483,6 +652,7 @@ export class Crawler {
         await probeClickNavigation(context, item.url, index, {
           expectedLabel: label,
           expectedKey: key,
+          maxNestedClicks: Math.max(0, maxDepth - item.depth),
           visitedActions,
           onResult: captureResult,
         });
@@ -494,7 +664,7 @@ export class Crawler {
 
   // Query-driven content: safely probes GET forms (search/filter/pagination) for their result URL.
   // POST/PUT/etc. forms and anything with a password field are never auto-submitted.
-  async #discoverForms({ context, extracted, item, screenId, startUrl, sameOriginOnly, maxFormsPerPage, queue, probeConcurrency = 1 }) {
+  async #discoverForms({ context, extracted, item, screenId, startUrl, sameOriginOnly, maxFormsPerPage, queue, graph, probeConcurrency = 1 }) {
     const forms = extracted.forms.slice(0, maxFormsPerPage);
     const normUrl = normalizeUrl(item.url);
 
@@ -517,9 +687,12 @@ export class Crawler {
       if (!resultUrl) return;
 
       const normResult = normalizeUrl(resultUrl);
-      if (normResult === normUrl || queue.hasVisited(normResult)) return;
+      if (normResult === normUrl) return;
       if (sameOriginOnly && !sameSite(resultUrl, startUrl)) return;
       if (!isNavigable(normResult)) return;
+      const known = graph.nodes.find((node) => normalizeUrl(node.url) === normResult);
+      if (known) graph.addEdge({ from: screenId, to: known.id, label: `form: "${form.action || item.url}"` });
+      if (queue.hasVisited(normResult)) return;
 
       queue.markVisited(normResult);
       queue.push({

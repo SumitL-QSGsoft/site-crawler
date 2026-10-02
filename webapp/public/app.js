@@ -40,6 +40,7 @@ form.addEventListener("submit", async (e) => {
     workers: document.getElementById("workers").value,
     sameOriginOnly: document.getElementById("sameOriginOnly").checked,
   };
+  payload.previousJobId = localStorage.getItem(`crawl:${payload.url}`) || undefined;
 
   resetUi();
   startBtn.disabled = true;
@@ -113,6 +114,7 @@ async function pollJob(jobId) {
 
     if (job.status === "done") {
       clearInterval(pollHandle);
+      localStorage.setItem(`crawl:${job.startUrl}`, jobId);
       setBadge("done");
       renderResults(job.result);
       finishUi();
@@ -196,7 +198,8 @@ function renderResults(result) {
 
 function renderStats(result) {
   const stats = [
-    ["Screens crawled", result.pagesDone],
+    ["Screens updated", result.pagesDone],
+    ["Total screens", result.screens.length],
     ["Modals found", result.modalCount],
     ["Actions (buttons)", result.actionCount],
     ["Forms", result.formCount],

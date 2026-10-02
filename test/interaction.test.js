@@ -4,7 +4,63 @@ import { chromium } from "playwright";
 import { installPageHelpers } from "../src/browser/page-helpers.js";
 import { NAV_CANDIDATE_SELECTOR, DESTRUCTIVE_TEXT_RE } from "../src/extraction/selectors.js";
 import { probeClickNavigation } from "../src/discovery/click-probe.js";
+import { probeFormSubmission } from "../src/discovery/form-probe.js";
 import { getCandidateSnapshot, getPageLinks } from "../src/discovery/dom-snapshot.js";
+
+test("click probe reports three successive views without URL changes", async () => {
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const context = await browser.newContext();
+    await context.addInitScript(installPageHelpers);
+    await context.route("http://crawler.test/**", (route) => route.fulfill({
+      contentType: "text/html",
+      body: `<main id="view"><h1>Start</h1><button onclick="show(1)">Open first</button></main>
+        <script>function show(level) {
+          document.querySelector('#view').innerHTML = '<h1>Level ' + level + '</h1>' +
+            (level < 3 ? '<button onclick="show(' + (level + 1) + ')">Open next</button>' : '<p>Final details</p>');
+        }</script>`,
+    }));
+    const results = [];
+    await probeClickNavigation(context, "http://crawler.test/", 0, {
+      onResult: async (result) => results.push({ type: result.type, depth: result.depth,
+        heading: await result.page.locator("h1").innerText() }),
+    });
+    assert.deepEqual(results, [
+      { type: "state", depth: 1, heading: "Level 1" },
+      { type: "state", depth: 2, heading: "Level 2" },
+      { type: "state", depth: 3, heading: "Level 3" },
+    ]);
+    await context.close();
+  } finally {
+    await browser.close();
+  }
+});
+
+test("form probe fills controlled inputs and clicks the submit button", async () => {
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const context = await browser.newContext();
+    await context.addInitScript(installPageHelpers);
+    await context.route("http://crawler.test/**", (route) => route.fulfill({
+      contentType: "text/html",
+      body: `<form action="/search" method="get"><input name="query" required>
+        <button type="submit">Search</button></form>
+        <script>
+          const input = document.querySelector('input');
+          let controlledValue = '';
+          input.addEventListener('input', () => { controlledValue = input.value; });
+          document.querySelector('form').addEventListener('submit', (event) => {
+            event.preventDefault();
+            location.href = '/search?query=' + encodeURIComponent(controlledValue);
+          });
+        </script>`,
+    }));
+    assert.equal(await probeFormSubmission(context, "http://crawler.test/", 0), "http://crawler.test/search?query=test");
+    await context.close();
+  } finally {
+    await browser.close();
+  }
+});
 
 test("click probe visits each disclosed item once, including dialog actions and links", async () => {
   const browser = await chromium.launch({ headless: true });
@@ -64,7 +120,7 @@ test("candidate sampling keeps distinct buttons and only the first table data it
     assert.deepEqual(ids, ["first", "second", "form-action", "row-first", "row-menu", "grid-first", "menu-first", "menu-second"]);
     const candidates = await getCandidateSnapshot(page);
     assert.notEqual(candidates[0].key, candidates[1].key);
-    assert.deepEqual((await getPageLinks(page)).map((link) => link.href), ["http://crawler.test/first"]);
+    assert.deepEqual((await getPageLinks(page)).map((link) => link.href), ["http://crawler.test/first", "http://crawler.test/second"]);
   } finally {
     await browser.close();
   }
@@ -90,6 +146,24 @@ test("a bare div-based grid row with only cursor:pointer (no role/onclick) is st
       { selector: NAV_CANDIDATE_SELECTOR, destructive: DESTRUCTIVE_TEXT_RE.source });
     // Only the first row of each container - "row-2"/"cell-2" are the same repeated data shape.
     assert.deepEqual(ids, ["pointer-row", "pointer-cell"]);
+  } finally {
+    await browser.close();
+  }
+});
+
+test("form probe does not submit a GET form through a POST override", async () => {
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const context = await browser.newContext();
+    await context.addInitScript(installPageHelpers);
+    let submitted = false;
+    await context.route("http://crawler.test/**", (route) => {
+      if (route.request().isNavigationRequest() && route.request().method() === "POST") submitted = true;
+      return route.fulfill({ contentType: "text/html", body: '<form method="get"><input name="q"><button formmethod="post">Submit</button></form>' });
+    });
+    assert.equal(await probeFormSubmission(context, "http://crawler.test/", 0), null);
+    assert.equal(submitted, false);
+    await context.close();
   } finally {
     await browser.close();
   }

@@ -17,7 +17,6 @@ export async function extractFrameContent(frameLike) {
 
       const links = deepQueryAll("a[href]")
         .filter(isVisible)
-        .filter(window.__crawlerHelpers.isSampledDataItem)
         .map((a) => ({ text: textOf(a) || "(no text)", href: a.href }))
         .filter((l) => l.href && !l.href.startsWith("javascript:"));
 

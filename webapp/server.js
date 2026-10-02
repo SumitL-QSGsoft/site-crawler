@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { BrowserManager } from "../src/browser/browser-manager.js";
 import { Crawler } from "../src/crawl/crawler.js";
 import { createLogger } from "../src/core/logger.js";
+import { normalizeUrl } from "../src/util/url-utils.js";
 
 // This server is a thin UI shell: all crawling logic (navigation, extraction, modal/form
 // discovery, screen/graph writing) is the unmodified engine from ../src — nothing here
@@ -36,14 +37,35 @@ let runningJobs = 0;
 const app = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
-app.use("/runs", express.static(RUNS_DIR));
+app.get("/runs/:jobId/screens/:screenId/screenshot.png", (req, res) => {
+  if (!/^[0-9a-f-]{36}$/i.test(req.params.jobId) || !/^[a-z0-9-]+$/.test(req.params.screenId)) {
+    return res.sendStatus(404);
+  }
+  res.sendFile(path.join(RUNS_DIR, req.params.jobId, "screens", req.params.screenId, "screenshot.png"));
+});
 
 app.post("/api/crawls", async (req, res) => {
-  const { url, maxPages, maxDepth, delayMs, sameOriginOnly, workers } = req.body || {};
+  const { url, maxPages, maxDepth, delayMs, sameOriginOnly, workers, previousJobId } = req.body || {};
 
   const urlError = validateTargetUrl(url);
   if (urlError) {
     return res.status(400).json({ error: urlError });
+  }
+  let baselineDir;
+  if (previousJobId) {
+    if (typeof previousJobId !== "string" || !/^[0-9a-f-]{36}$/i.test(previousJobId)) {
+      return res.status(400).json({ error: "Invalid previous crawl ID." });
+    }
+    baselineDir = path.join(RUNS_DIR, previousJobId);
+    try {
+      const saved = JSON.parse(await fs.readFile(path.join(baselineDir, "crawl-state.json"), "utf8"));
+      if (normalizeUrl(saved.startUrl) !== normalizeUrl(url)) {
+        return res.status(400).json({ error: "Previous crawl belongs to a different URL." });
+      }
+    } catch (error) {
+      if (error.code !== "ENOENT") return res.status(400).json({ error: "Previous crawl is invalid." });
+      baselineDir = undefined;
+    }
   }
   if (runningJobs >= MAX_CONCURRENT_JOBS) {
     return res.status(429).json({ error: "Another crawl is already running. Please wait for it to finish." });
@@ -69,6 +91,7 @@ app.post("/api/crawls", async (req, res) => {
   runCrawlJob(job, outDir, {
     startUrl: url,
     outDir,
+    baselineDir,
     maxPages: clampInt(maxPages, 1, 300, 30),
     maxDepth: clampInt(maxDepth, 0, 20, 3),
     delayMs: clampInt(delayMs, 100, 5000, 400),
@@ -213,6 +236,7 @@ async function runCrawlJob(job, outDir, config) {
       edges,
       screens,
     };
+    logger.info(`Crawl complete: ${pagesDone} screen(s) updated, ${screens.length} total screen(s).`);
     job.status = "done";
   } finally {
     await browserManager.close();

@@ -10,6 +10,9 @@ export class CrawlQueue {
   #visited = new Set();
   #visitedStates = new Set();
   #probedContent = new Set();
+  #waiting = [];
+  #active = 0;
+  #stopped = false;
 
   seed(item, normalizedUrl) {
     this.#items.push(item);
@@ -51,17 +54,41 @@ export class CrawlQueue {
   // Appends to the top of the stack - the next item popped, diving deeper into the current
   // branch rather than fanning out breadth-first.
   push(item) {
-    this.#items.push(item);
+    if (this.#stopped) return;
+    const waiter = this.#waiting.shift();
+    if (waiter) {
+      this.#active += 1;
+      waiter(item);
+    } else {
+      this.#items.push(item);
+    }
   }
 
   // Puts an already-dequeued item back on top for immediate reprocessing (e.g. retrying the
   // current URL right after authenticating) - same end as push() since that's "next" now.
   unshift(item) {
-    this.#items.push(item);
+    this.push(item);
   }
 
-  shift() {
-    return this.#items.pop();
+  async next() {
+    if (this.#stopped) return null;
+    const item = this.#items.pop();
+    if (item) {
+      this.#active += 1;
+      return item;
+    }
+    if (!this.#active) return null;
+    return new Promise((resolve) => this.#waiting.push(resolve));
+  }
+
+  finish() {
+    this.#active -= 1;
+    if (!this.#active && !this.#items.length) this.stop();
+  }
+
+  stop() {
+    this.#stopped = true;
+    for (const resolve of this.#waiting.splice(0)) resolve(null);
   }
 
   get length() {

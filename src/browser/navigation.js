@@ -1,10 +1,65 @@
+const pendingDataRequests = new WeakMap();
+
 // Navigates like a real user would: don't block on strict networkidle (some SPAs keep a socket
 // open forever, e.g. live dashboards/chat), just wait for the DOM then give the network a bounded
 // chance to settle before we read the page. Avoids the whole page being skipped on a load timeout.
-export async function gotoAndSettle(target, url, { timeout = 30000 } = {}) {
+export async function gotoAndSettle(target, url, { timeout = 30000, idleTimeout = 2500 } = {}) {
+  if (!pendingDataRequests.has(target)) {
+    const pending = new Set();
+    pendingDataRequests.set(target, pending);
+    target.on("request", (request) => {
+      if (["fetch", "xhr"].includes(request.resourceType())) pending.add(request);
+    });
+    target.on("requestfinished", (request) => pending.delete(request));
+    target.on("requestfailed", (request) => pending.delete(request));
+  }
   const response = await target.goto(url, { waitUntil: "domcontentloaded", timeout });
-  await target.waitForLoadState("networkidle", { timeout: 2500 }).catch(() => { });
+  await target.waitForLoadState("networkidle", { timeout: idleTimeout }).catch(() => { });
   return response;
+}
+
+export async function waitForContentReady(page, { timeout = 6000 } = {}) {
+  const ready = await page.waitForFunction(() => {
+    const content = document.querySelector('main, [role="main"]');
+    const root = content || document.body;
+    const text = root?.innerText?.trim() || "";
+    const loading = /\bloading(?:\.{1,3}|\s)/i.test(text) ||
+      Boolean(document.querySelector('[aria-busy="true"], [role="progressbar"]'));
+    const appRoot = document.querySelector('#app, #root, [data-reactroot]');
+    let hasContent;
+    if (appRoot) {
+      const view = appRoot.cloneNode(true);
+      view.querySelectorAll('nav, header, aside, footer, [role="navigation"], script, style').forEach((node) => node.remove());
+      hasContent = Boolean(view.textContent.trim() ||
+        view.querySelector('img[alt], canvas, a[href], button, form, table, [role="grid"]'));
+    } else {
+      hasContent = Boolean(content?.innerText?.trim() ||
+        root?.querySelector('h1, h2, form, table, [role="grid"], a[href], button, input[type="password"]'));
+    }
+    return hasContent && !loading;
+  }, null, { timeout, polling: 250 }).then(() => true).catch(() => false);
+  if (!ready) return false;
+
+  const pending = pendingDataRequests.get(page);
+  if (pending?.size) {
+    const initialText = await page.evaluate(() => document.body.innerText.trim());
+    await new Promise((resolve) => {
+      const finish = () => {
+        clearTimeout(timer);
+        page.off("requestfinished", check);
+        page.off("requestfailed", check);
+        resolve();
+      };
+      const check = () => { if (!pending.size) finish(); };
+      const timer = setTimeout(finish, timeout);
+      page.on("requestfinished", check);
+      page.on("requestfailed", check);
+      check();
+    });
+    await page.waitForFunction((text) => document.body.innerText.trim() !== text, initialText,
+      { timeout: 800 }).catch(() => { });
+  }
+  return true;
 }
 
 // Waits for an observable outcome after an interaction that *might* trigger navigation (a real
@@ -18,7 +73,7 @@ export async function gotoAndSettle(target, url, { timeout = 30000 } = {}) {
 // probes hit a dead/no-op element, and with potentially dozens of candidates per screen, every
 // probe paying the full window for that common case is the single biggest avoidable crawl-time
 // cost - most real UI reacts to a click within a couple of render frames, not seconds.
-export async function settleAfterAction(page, initialUrl, { timeout = 4000 } = {}) {
+export async function settleAfterAction(page, initialUrl, { timeout = 800 } = {}) {
   const navigated = await page
     .waitForFunction((initial) => window.location.href !== initial, initialUrl, { timeout })
     .then(() => true)

@@ -30,10 +30,9 @@ export async function getCandidateSnapshot(page, { includeLinks = false } = {}) 
 // only renders once it's opened (so they weren't part of the page's original link set).
 export async function getPageLinks(page) {
   return page.evaluate(() => {
-    const { deepQueryAll, isVisible, isSampledDataItem, textOf } = window.__crawlerHelpers;
+    const { deepQueryAll, isVisible, textOf } = window.__crawlerHelpers;
     return deepQueryAll("a[href]")
       .filter(isVisible)
-      .filter(isSampledDataItem)
       .map((a) => ({ text: textOf(a) || "(no text)", href: a.href }))
       .filter((l) => l.href && !l.href.startsWith("javascript:"));
   });
